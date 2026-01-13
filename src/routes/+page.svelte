@@ -1,106 +1,158 @@
 <script lang="ts">
-    let offerCode = $state("");
-    let answerCode = $state("");
+    import {
+        createAnswer,
+        createCandidates,
+        createRoom,
+        deleteCandidates,
+        getCandidates,
+        getRoom,
+    } from "./call.remote";
+
+    let code = $state("");
 
     let localVideo: HTMLVideoElement;
     let remoteVideo: HTMLVideoElement;
 
     let pc: RTCPeerConnection;
+    let localStream: MediaStream;
+    let remoteStream: MediaStream;
+    let polling: NodeJS.Timeout | null = null;
 
-    function createPeer() {
-        pc = new RTCPeerConnection({
-            iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-        });
+    const config = {
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    };
 
-        pc.ontrack = (event) => {
-            remoteVideo.srcObject = event.streams[0];
+    function initPeerConnection(role: "offer" | "answer") {
+        pc = new RTCPeerConnection(config);
+
+        pc.onicecandidate = ({ candidate }) => {
+            if (!candidate) return;
+
+            createCandidates({
+                roomID: code,
+                role,
+                candidate: JSON.stringify(candidate),
+            });
+        };
+
+        pc.onconnectionstatechange = () => {
+            console.log(pc.connectionState);
+            if (pc.connectionState === "connected") stopPolling();
         };
     }
 
-    async function setupVideoStreams() {
-        let localStream = await navigator.mediaDevices.getUserMedia({
+    async function setupStreams() {
+        localStream = await navigator.mediaDevices.getUserMedia({
             video: true,
             audio: true,
         });
+
+        localStream
+            .getTracks()
+            .forEach((track) => pc.addTrack(track, localStream));
+
         localVideo.srcObject = localStream;
 
-        localStream.getTracks().forEach((track) => {
-            pc.addTrack(track, localStream);
-        });
+        remoteStream = new MediaStream();
+        pc.ontrack = ({ streams }) => {
+            streams[0]
+                .getTracks()
+                .forEach((track) => remoteStream.addTrack(track));
+        };
+        remoteVideo.srcObject = remoteStream;
     }
 
-    async function createSession() {
-        createPeer();
-        await setupVideoStreams();
+    function stopPolling() {
+        if (polling) {
+            clearInterval(polling);
+            polling = null;
+            console.log("Signaling finished, polling stopped");
+            deleteCandidates(code);
+            console.log("Cleaning up ICE candidates");
+        }
+    }
+
+    function startPolling(
+        onRemoteDescription: (room: any) => Promise<void>,
+        candidateRole: "offer" | "answer",
+    ) {
+        polling = setInterval(async () => {
+            const room = await getRoom(code);
+            await onRemoteDescription(room);
+
+            const candidates = await getCandidates(code);
+            for (const can of candidates) {
+                if (can.role === candidateRole && can.candidate) {
+                    await pc.addIceCandidate(JSON.parse(can.candidate));
+                }
+            }
+        }, 500);
+    }
+
+    async function startCall() {
+        initPeerConnection("offer");
+        await setupStreams();
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
 
-        // wait till all ice candidates is done
-        // then set the offer
-        await new Promise((resolve) => {
-            if (pc.iceGatheringState === "complete") return resolve(null);
-            pc.onicegatheringstatechange = () => {
-                if (pc.iceGatheringState === "complete") resolve(null);
-            };
+        await createRoom({
+            roomID: code,
+            offer: JSON.stringify(offer),
         });
 
-        offerCode = btoa(JSON.stringify(pc.localDescription));
+        let answerSet = false;
+
+        startPolling(async (room) => {
+            if (!answerSet && room?.answer) {
+                await pc.setRemoteDescription(JSON.parse(room.answer));
+                answerSet = true;
+            }
+        }, "answer");
     }
 
-    async function joinSession() {
-        createPeer();
-        await setupVideoStreams();
+    async function joinCall() {
+        initPeerConnection("answer");
+        await setupStreams();
 
-        const decodedOffer = JSON.parse(atob(offerCode));
-        await pc.setRemoteDescription(decodedOffer);
+        let offerSet = false;
 
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
+        startPolling(async (room) => {
+            if (!offerSet && room?.offer) {
+                await pc.setRemoteDescription(JSON.parse(room.offer));
+                offerSet = true;
 
-        // wait till all ice candidates is done
-        // then set the answer
-        await new Promise((resolve) => {
-            if (pc.iceGatheringState === "complete") return resolve(null);
-            pc.onicegatheringstatechange = () => {
-                if (pc.iceGatheringState === "complete") resolve(null);
-            };
-        });
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
 
-        answerCode = btoa(JSON.stringify(pc.localDescription));
-    }
-
-    // for host to take answerCode from remote user and accept it
-    async function acceptAnswer() {
-        const decoded = JSON.parse(atob(answerCode));
-        await pc.setRemoteDescription(decoded);
-        console.log("ANSWER ACCEPTED");
+                await createAnswer({
+                    roomID: code,
+                    answer: JSON.stringify(answer),
+                });
+            }
+        }, "offer");
     }
 </script>
 
-<div class="flex flex-col h-screen p-4 gap-4">
-    <div class="flex flex-row gap-4 justify-center">
-        <video
-            bind:this={localVideo}
-            autoplay
-            playsinline
-            muted
-            class="w-1/2 bg-black rounded"
-        ></video>
+<div class="flex flex-col items-center gap-2 h-fit">
+    <input type="text" placeholder="code" bind:value={code} />
 
-        <video
-            bind:this={remoteVideo}
-            autoplay
-            playsinline
-            class="w-1/2 bg-black rounded"
-        ></video>
-    </div>
+    <button onclick={startCall}>START CALL</button>
+    <button onclick={joinCall}>JOIN CALL</button>
 
-    <button onclick={createSession}>Host</button>
-    <textarea bind:value={offerCode} placeholder="Offer Code"></textarea>
+    <video
+        bind:this={localVideo}
+        autoplay
+        muted
+        playsinline
+        class="rounded bg-black"
+    ></video>
 
-    <button onclick={joinSession}>Join</button>
-    <textarea bind:value={answerCode} placeholder="Answer Code"></textarea>
-
-    <button onclick={acceptAnswer}>Accept Answer</button>
+    <video
+        bind:this={remoteVideo}
+        autoplay
+        playsinline
+        class="rounded bg-black"
+    >
+    </video>
 </div>
